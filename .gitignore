@@ -1,0 +1,8 @@
+# Generated / bundled S2 archives (case-insensitive)
+*.[Rr][Ee][Ss]00
+*.[Rr][Ee][Ss][Dd][Tt]
+*.[Aa][Rr][Cc][Hh]00
+
+# Python
+__pycache__/
+*.pyc
