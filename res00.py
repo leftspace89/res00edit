@@ -16,8 +16,12 @@ MAGIC = 0x4B454248          # "HBEK"
 VERSION = 2
 HEADER_FMT = "<8I16s"       # magic, ver, strsize, nodes, files, f0, f1, f2, guid
 HEADER_SIZE = 48
-RECORD_FMT = "<IQQQIQQ"     # name, data_off, comp, uncomp, flags, res0, res1
+RECORD_FMT = "<IQQQIQQ"     # name, data_off, comp, uncomp, flags, seg2_off, seg2_size
 RECORD_SIZE = 48
+# Large files can be stored in two pieces: comp bytes at data_off, then
+# seg2_size bytes at seg2_off, concatenated and inflated as one zlib stream.
+# (Engine: CInCompressedStream::Read / sub_42F788 in TheRaw.exe.) The packer
+# always writes a single segment, leaving these two trailing fields zero.
 NODE_FMT = "<Iiii"          # name, child, next, record_count
 NODE_SIZE = 16
 
@@ -27,6 +31,41 @@ FLAG_ZLIB = 9
 DELETE_DIR = ".deleteDirectory"
 CRC_DIR = "CRC"
 SEP_MODES = ("backslash", "forward", "all")
+
+
+class _Progress:
+    """Minimal, dependency-free console progress bar (drawn on stderr).
+
+    Animates only on a real terminal so redirected output stays clean; the
+    final per-command summary is printed regardless.
+    """
+
+    def __init__(self, total, label, enabled=True, width=34):
+        self.total = total
+        self.label = label
+        self.width = width
+        self.n = 0
+        self._last = -1
+        self.enabled = enabled and total > 0 and sys.stderr.isatty()
+
+    def update(self, n=1):
+        self.n += n
+        if not self.enabled:
+            return
+        pct = self.n * 100 // self.total
+        if pct == self._last:
+            return
+        self._last = pct
+        filled = self.width * self.n // self.total
+        bar = "#" * filled + "-" * (self.width - filled)
+        sys.stderr.write("\r%s [%s] %3d%% (%d/%d)"
+                         % (self.label, bar, pct, self.n, self.total))
+        sys.stderr.flush()
+
+    def done(self):
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def guid_string(guid):
@@ -130,6 +169,7 @@ def pack(input_dir, res00_path, resdt_path, compress=True, guid=None,
     total_in = total_out = 0
     folder_recs = {}
     crc_rec = None
+    bar = _Progress(sum(len(v) for v in folders.values()), "packing", verbose)
     try:
         for canon in folders:
             recs = []
@@ -150,6 +190,7 @@ def pack(input_dir, res00_path, resdt_path, compress=True, guid=None,
                 data_offset += len(blob)
                 total_in += uncomp
                 total_out += len(blob)
+                bar.update()
             if not recs and canon != "":
                 recs.append([DELETE_DIR, 0, 0, 0, FLAG_ZLIB])
             folder_recs[canon] = recs
@@ -186,6 +227,7 @@ def pack(input_dir, res00_path, resdt_path, compress=True, guid=None,
             data_offset += len(manifest)
     finally:
         resdt.close()
+        bar.done()
 
     # child/next tree over canonical nodes only (lookup ignores it)
     children = {}
@@ -241,14 +283,18 @@ def pack(input_dir, res00_path, resdt_path, compress=True, guid=None,
 #  Reading
 # --------------------------------------------------------------------------- #
 class Record:
-    __slots__ = ("name", "data_offset", "comp_size", "uncomp_size", "flags")
+    __slots__ = ("name", "data_offset", "comp_size", "uncomp_size", "flags",
+                 "seg2_offset", "seg2_size")
 
-    def __init__(self, name, data_offset, comp_size, uncomp_size, flags):
+    def __init__(self, name, data_offset, comp_size, uncomp_size, flags,
+                 seg2_offset=0, seg2_size=0):
         self.name = name
         self.data_offset = data_offset
         self.comp_size = comp_size
         self.uncomp_size = uncomp_size
         self.flags = flags
+        self.seg2_offset = seg2_offset
+        self.seg2_size = seg2_size
 
 
 class Node:
@@ -281,8 +327,8 @@ class Archive:
 
         self.records = []
         for _ in range(fcount):
-            no, doff, comp, unc, fl, _r0, _r1 = struct.unpack_from(RECORD_FMT, blob, off)
-            self.records.append(Record(cstr(no), doff, comp, unc, fl))
+            no, doff, comp, unc, fl, s2off, s2sz = struct.unpack_from(RECORD_FMT, blob, off)
+            self.records.append(Record(cstr(no), doff, comp, unc, fl, s2off, s2sz))
             off += RECORD_SIZE
 
         self.nodes = []
@@ -314,20 +360,26 @@ class Archive:
 
 
 def _read_blob(resdt, rec):
-    resdt.seek(rec.data_offset)
-    data = resdt.read(rec.comp_size)
     if rec.uncomp_size == 0:
         return b""
-    if rec.flags == FLAG_ZLIB:
+    resdt.seek(rec.data_offset)
+    data = resdt.read(rec.comp_size)
+    if rec.seg2_size:
+        # split storage: remainder of the compressed stream lives elsewhere
+        resdt.seek(rec.seg2_offset)
+        data += resdt.read(rec.seg2_size)
+    if rec.flags != FLAG_STORED:
         return zlib.decompress(data)
     return data
 
 
 def unpack(res00_path, resdt_path, out_dir, verbose=True):
     arc = Archive(res00_path)
+    entries = list(arc.entries(dedupe=True))
+    bar = _Progress(len(entries), "extracting", verbose)
     with open(resdt_path, "rb") as resdt:
         n = 0
-        for folder, rec in arc.entries(dedupe=True):
+        for folder, rec in entries:
             rel = (folder + "\\" + rec.name) if folder else rec.name
             dest = os.path.join(out_dir, rel.replace("\\", os.sep))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -338,6 +390,8 @@ def unpack(res00_path, resdt_path, out_dir, verbose=True):
             with open(dest, "wb") as out:
                 out.write(data)
             n += 1
+            bar.update()
+        bar.done()
         for node in arc.nodes:
             p = node.path.replace("/", "\\")
             if p:
@@ -360,9 +414,12 @@ def info(res00_path):
           % (len(arc.nodes), sorted_ok))
     print("  file records  : %d (%d real, %d unique physical files)"
           % (len(arc.records), nfiles, nuniq))
-    comp = sum(r.comp_size for r in arc.records)
+    comp = sum(r.comp_size + r.seg2_size for r in arc.records)
     unc = sum(r.uncomp_size for r in arc.records)
+    nsplit = sum(1 for r in arc.records if r.seg2_size)
     print("  data size     : %d bytes compressed / %d uncompressed" % (comp, unc))
+    if nsplit:
+        print("  split records : %d (compressed stream stored in two segments)" % nsplit)
     print("  sample entries:")
     for i, (folder, rec) in enumerate(arc.entries(dedupe=True)):
         if i >= 12:
